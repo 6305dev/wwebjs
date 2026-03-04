@@ -8,8 +8,10 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "cors": "^2.8.6",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "mysql2": "^3.18.2",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.1",
     "whatsapp-web.js": "^1.26.1-alpha.3"

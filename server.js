@@ -5,6 +5,8 @@ const { Server } = require("socket.io");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
 const path = require("path");
+const cors = require("cors");
+const { initDatabase, logMessage } = require("./db");
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const API_KEY = process.env.API_KEY || "your-secret-api-key-here";
@@ -15,6 +17,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
+app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -155,6 +158,14 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
 
     const response = await waClient.sendMessage(chatId, message);
 
+    // Log to database
+    await logMessage({
+      messageId: response.id._serialized,
+      number: formattedNumber,
+      message,
+      status: "sent",
+    });
+
     // Emit event to web client
     io.emit("message_sent", {
       number: formattedNumber,
@@ -174,6 +185,16 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
     });
   } catch (error) {
     console.error("[API] Send message error:", error);
+
+    // Log failed message to database
+    await logMessage({
+      messageId: null,
+      number: req.body.number || "",
+      message: req.body.message || "",
+      status: "failed",
+      errorMessage: error.message,
+    });
+
     res.status(500).json({
       success: false,
       message: "Gagal mengirim pesan",
@@ -183,10 +204,11 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`\n🚀 WhatsApp Gateway API running on http://localhost:${PORT}`);
   console.log(`📱 Open browser to scan QR code`);
   console.log(`🔑 API Key: ${API_KEY}\n`);
+  await initDatabase();
 });
 
 waClient.initialize();
