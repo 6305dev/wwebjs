@@ -1,0 +1,17 @@
+{
+  "name": "wwebjs-gateway",
+  "version": "1.0.0",
+  "description": "WhatsApp Gateway API using whatsapp-web.js",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "whatsapp-web.js": "^1.26.1-alpha.3"
+  }
+}
