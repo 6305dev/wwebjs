@@ -207,7 +207,6 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
 server.listen(PORT, async () => {
   console.log(`\n🚀 WhatsApp Gateway API running on http://localhost:${PORT}`);
   console.log(`📱 Open browser to scan QR code`);
-  console.log(`🔑 API Key: ${API_KEY}\n`);
   await initDatabase();
 });
 
