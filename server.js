@@ -130,7 +130,7 @@ app.get("/api/status", (req, res) => {
 // Send message
 app.post("/api/send-message", authenticateApiKey, async (req, res) => {
   try {
-    const { number, message } = req.body;
+    const { number, message, referal } = req.body;
 
     if (!number || !message) {
       return res.status(400).json({
@@ -161,6 +161,7 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
     // Log to database
     await logMessage({
       messageId: response.id._serialized,
+      sender: referal,
       number: formattedNumber,
       message,
       status: "sent",

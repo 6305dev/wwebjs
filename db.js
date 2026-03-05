@@ -36,6 +36,7 @@ async function initDatabase() {
 // ─── Log Message ────────────────────────────────────────────────────────────────
 async function logMessage({
   messageId,
+  sender,
   number,
   message,
   status = "sent",
@@ -43,8 +44,8 @@ async function logMessage({
 }) {
   try {
     const [result] = await pool.execute(
-      `INSERT INTO message_logs (message_id, number, message, status, error_message) VALUES (?, ?, ?, ?, ?)`,
-      [messageId || null, number, message, status, errorMessage],
+      `INSERT INTO message_logs (message_id, sender, number, message, status, error_message) VALUES (?, ?, ?, ?, ?, ?)`,
+      [messageId || null, sender, number, message, status, errorMessage],
     );
     return result.insertId;
   } catch (err) {
