@@ -12,6 +12,18 @@ const { initDatabase, logMessage } = require("./db");
 const API_KEY = process.env.API_KEY || "your-secret-api-key-here";
 const PORT = process.env.PORT || 3000;
 
+// ─── Anti-Ban Config ───────────────────────────────────────────────────────────
+const ANTI_BAN = {
+  MIN_DELAY_MS: 3000, // Minimum delay antar pesan (3 detik)
+  MAX_DELAY_MS: 8000, // Maximum delay antar pesan (8 detik)
+  MAX_MESSAGES_PER_MINUTE: 10, // Maks pesan per menit
+  MAX_UNIQUE_NUMBERS_PER_DAY: 300, // Maks nomor unik per hari
+  MAX_MESSAGE_LENGTH: 4096, // Maks panjang pesan
+  DUPLICATE_WINDOW_MS: 60 * 60 * 1000, // Cek duplikasi dalam 1 jam
+  RECONNECT_BASE_DELAY: 5000, // Base delay reconnect (5 detik)
+  RECONNECT_MAX_DELAY: 300000, // Max delay reconnect (5 menit)
+};
+
 // ─── Express + Socket.IO Setup ─────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
@@ -25,6 +37,122 @@ app.use(express.static(path.join(__dirname, "public")));
 let clientReady = false;
 let currentStatus = "initializing"; // initializing | qr | authenticated | ready | disconnected
 let lastQrDataUrl = null;
+let reconnectAttempts = 0;
+
+// ─── Anti-Ban: Rate Limiting & Tracking ────────────────────────────────────────
+const messageTimestamps = []; // Timestamps pesan terkirim (rate limiting)
+const dailyUniqueNumbers = new Set(); // Nomor unik hari ini
+let dailyResetDate = new Date().toDateString();
+const recentMessages = new Map(); // key: "number:messageHash" → timestamp (duplikasi)
+
+// Message queue untuk delay antar pesan
+const messageQueue = [];
+let isProcessingQueue = false;
+
+function getRandomDelay() {
+  return Math.floor(
+    Math.random() * (ANTI_BAN.MAX_DELAY_MS - ANTI_BAN.MIN_DELAY_MS) +
+      ANTI_BAN.MIN_DELAY_MS,
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0;
+  }
+  return hash.toString();
+}
+
+function checkRateLimit() {
+  const now = Date.now();
+  // Hapus timestamps yang lebih tua dari 1 menit
+  while (messageTimestamps.length > 0 && now - messageTimestamps[0] > 60000) {
+    messageTimestamps.shift();
+  }
+  return messageTimestamps.length < ANTI_BAN.MAX_MESSAGES_PER_MINUTE;
+}
+
+function checkDailyLimit(number) {
+  // Reset jika hari sudah berganti
+  const today = new Date().toDateString();
+  if (today !== dailyResetDate) {
+    dailyUniqueNumbers.clear();
+    dailyResetDate = today;
+  }
+  // Jika nomor sudah pernah dikirim hari ini, tidak menambah counter
+  if (dailyUniqueNumbers.has(number)) return true;
+  return dailyUniqueNumbers.size < ANTI_BAN.MAX_UNIQUE_NUMBERS_PER_DAY;
+}
+
+function checkDuplicate(number, message) {
+  const key = `${number}:${simpleHash(message)}`;
+  const lastSent = recentMessages.get(key);
+  if (lastSent && Date.now() - lastSent < ANTI_BAN.DUPLICATE_WINDOW_MS) {
+    return true; // Is duplicate
+  }
+  return false;
+}
+
+function recordMessage(number, message) {
+  const key = `${number}:${simpleHash(message)}`;
+  recentMessages.set(key, Date.now());
+  messageTimestamps.push(Date.now());
+  dailyUniqueNumbers.add(number);
+
+  // Cleanup old duplicate records
+  const now = Date.now();
+  for (const [k, v] of recentMessages.entries()) {
+    if (now - v > ANTI_BAN.DUPLICATE_WINDOW_MS) {
+      recentMessages.delete(k);
+    }
+  }
+}
+
+// ─── Message Queue Processor ───────────────────────────────────────────────────
+async function processQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+
+  while (messageQueue.length > 0) {
+    const task = messageQueue.shift();
+
+    try {
+      if (!clientReady) {
+        task.reject(new Error("WhatsApp client tidak siap"));
+        continue;
+      }
+
+      // Random delay sebelum kirim (meniru perilaku manusia)
+      const delay = getRandomDelay();
+      console.log(
+        `[QUEUE] Waiting ${delay}ms before sending to ${task.chatId}...`,
+      );
+      await sleep(delay);
+
+      const response = await waClient.sendMessage(task.chatId, task.message);
+      recordMessage(task.number, task.message);
+      task.resolve(response);
+    } catch (error) {
+      task.reject(error);
+    }
+  }
+
+  isProcessingQueue = false;
+}
+
+function enqueueMessage(chatId, number, message) {
+  return new Promise((resolve, reject) => {
+    messageQueue.push({ chatId, number, message, resolve, reject });
+    processQueue();
+  });
+}
 
 // ─── WhatsApp Client ───────────────────────────────────────────────────────────
 const waClient = new Client({
@@ -65,6 +193,7 @@ waClient.on("qr", async (qr) => {
 
 waClient.on("authenticated", () => {
   lastQrDataUrl = null;
+  reconnectAttempts = 0; // Reset reconnect counter on success
   updateStatus("authenticated");
 });
 
@@ -77,6 +206,7 @@ waClient.on("auth_failure", (msg) => {
 waClient.on("ready", () => {
   clientReady = true;
   lastQrDataUrl = null;
+  reconnectAttempts = 0; // Reset reconnect counter on success
   updateStatus("ready");
   console.log("[WA] Client is ready!");
 });
@@ -86,12 +216,21 @@ waClient.on("disconnected", (reason) => {
   lastQrDataUrl = null;
   updateStatus("disconnected", { reason });
   console.log("[WA] Disconnected:", reason);
-  // Auto-reinitialize after disconnect
+
+  // Exponential backoff reconnect (anti-ban)
+  reconnectAttempts++;
+  const delay = Math.min(
+    ANTI_BAN.RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts - 1),
+    ANTI_BAN.RECONNECT_MAX_DELAY,
+  );
+  console.log(
+    `[WA] Reconnecting in ${delay / 1000}s (attempt #${reconnectAttempts})...`,
+  );
   setTimeout(() => {
     console.log("[WA] Reinitializing...");
     updateStatus("initializing");
     waClient.initialize();
-  }, 5000);
+  }, delay);
 });
 
 // ─── Socket.IO ─────────────────────────────────────────────────────────────────
@@ -124,18 +263,30 @@ app.get("/api/status", (req, res) => {
     success: true,
     status: currentStatus,
     ready: clientReady,
+    queueLength: messageQueue.length,
+    dailyUniqueCount: dailyUniqueNumbers.size,
+    dailyLimit: ANTI_BAN.MAX_UNIQUE_NUMBERS_PER_DAY,
   });
 });
 
-// Send message
+// Send message (with anti-ban protections)
 app.post("/api/send-message", authenticateApiKey, async (req, res) => {
   try {
     const { number, message, referal } = req.body;
 
+    // ─── Validasi Input ──────────────────────────────────────────
     if (!number || !message) {
       return res.status(400).json({
         success: false,
         message: 'Parameter "number" dan "message" wajib diisi',
+      });
+    }
+
+    // Validasi panjang pesan
+    if (message.length > ANTI_BAN.MAX_MESSAGE_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        message: `Pesan terlalu panjang. Maksimal ${ANTI_BAN.MAX_MESSAGE_LENGTH} karakter.`,
       });
     }
 
@@ -147,7 +298,7 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
       });
     }
 
-    // Format number: remove non-digits, handle 08xx → 628xx
+    // ─── Format Nomor ────────────────────────────────────────────
     let formattedNumber = number.replace(/\D/g, "");
     if (formattedNumber.startsWith("0")) {
       formattedNumber = "62" + formattedNumber.slice(1);
@@ -156,7 +307,52 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
       ? formattedNumber
       : `${formattedNumber}@c.us`;
 
-    const response = await waClient.sendMessage(chatId, message);
+    // ─── Anti-Ban Checks ─────────────────────────────────────────
+
+    // 1. Rate limit check
+    if (!checkRateLimit()) {
+      return res.status(429).json({
+        success: false,
+        message: `Terlalu banyak pesan. Maksimal ${ANTI_BAN.MAX_MESSAGES_PER_MINUTE} pesan/menit. Coba lagi nanti.`,
+      });
+    }
+
+    // 2. Daily limit check
+    if (!checkDailyLimit(formattedNumber)) {
+      return res.status(429).json({
+        success: false,
+        message: `Batas harian tercapai. Maksimal ${ANTI_BAN.MAX_UNIQUE_NUMBERS_PER_DAY} nomor unik/hari.`,
+      });
+    }
+
+    // 3. Duplicate check
+    if (checkDuplicate(formattedNumber, message)) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Pesan yang sama sudah dikirim ke nomor ini dalam 1 jam terakhir.",
+      });
+    }
+
+    // 4. Cek apakah nomor terdaftar di WhatsApp
+    try {
+      const isRegistered = await waClient.isRegisteredUser(chatId);
+      if (!isRegistered) {
+        return res.status(400).json({
+          success: false,
+          message: "Nomor tidak terdaftar di WhatsApp.",
+        });
+      }
+    } catch (checkErr) {
+      console.warn(
+        "[WA] Could not verify number registration:",
+        checkErr.message,
+      );
+      // Lanjutkan kirim meskipun gagal cek (jangan block sepenuhnya)
+    }
+
+    // ─── Kirim via Queue (dengan delay otomatis) ─────────────────
+    const response = await enqueueMessage(chatId, formattedNumber, message);
 
     // Log to database
     await logMessage({
@@ -188,13 +384,18 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
     console.error("[API] Send message error:", error);
 
     // Log failed message to database
-    await logMessage({
-      messageId: null,
-      number: req.body.number || "",
-      message: req.body.message || "",
-      status: "failed",
-      errorMessage: error.message,
-    });
+    try {
+      await logMessage({
+        messageId: null,
+        sender: req.body.referal || null,
+        number: req.body.number || "",
+        message: req.body.message || "",
+        status: "failed",
+        errorMessage: error.message,
+      });
+    } catch (logErr) {
+      console.error("[DB] Failed to log error:", logErr.message);
+    }
 
     res.status(500).json({
       success: false,
@@ -208,6 +409,14 @@ app.post("/api/send-message", authenticateApiKey, async (req, res) => {
 server.listen(PORT, async () => {
   console.log(`\n🚀 WhatsApp Gateway API running on http://localhost:${PORT}`);
   console.log(`📱 Open browser to scan QR code`);
+  console.log(`🛡️  Anti-ban protections ACTIVE:`);
+  console.log(`   • Rate limit: ${ANTI_BAN.MAX_MESSAGES_PER_MINUTE} msg/min`);
+  console.log(
+    `   • Delay: ${ANTI_BAN.MIN_DELAY_MS / 1000}-${ANTI_BAN.MAX_DELAY_MS / 1000}s antar pesan`,
+  );
+  console.log(
+    `   • Daily limit: ${ANTI_BAN.MAX_UNIQUE_NUMBERS_PER_DAY} unique numbers/day`,
+  );
   await initDatabase();
 });
 
