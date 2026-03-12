@@ -14,8 +14,8 @@ const PORT = process.env.PORT || 3000;
 
 // ─── Anti-Ban Config ───────────────────────────────────────────────────────────
 const ANTI_BAN = {
-  MIN_DELAY_MS: 3000, // Minimum delay antar pesan (3 detik)
-  MAX_DELAY_MS: 8000, // Maximum delay antar pesan (8 detik)
+  MIN_DELAY_MS: 1000, // Minimum delay antar pesan (3 detik)
+  MAX_DELAY_MS: 1000, // Maximum delay antar pesan (8 detik)
   MAX_MESSAGES_PER_MINUTE: 10, // Maks pesan per menit
   MAX_UNIQUE_NUMBERS_PER_DAY: 300, // Maks nomor unik per hari
   MAX_MESSAGE_LENGTH: 4096, // Maks panjang pesan
